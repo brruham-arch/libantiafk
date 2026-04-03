@@ -9,15 +9,14 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-// ─── ModInfo — SAMA PERSIS dengan versi pertama yang crash ───
-// Versi pertama terbukti ter-load AML (crash di OnModLoad bukan di GetModInfo)
+// ─── ModInfo ─────────────────────────────────────────────
 struct ModInfo_t {
-    unsigned int  handlerVer;   // = 1, WAJIB di posisi pertama
+    unsigned int  handlerVer;
     const char*   id;
     const char*   name;
     const char*   version;
     const char*   author;
-    unsigned int  flags;        // = 0
+    unsigned int  flags;
 };
 
 static ModInfo_t g_modInfo = {
@@ -29,51 +28,23 @@ static ModInfo_t g_modInfo = {
     0
 };
 
-// ─── Offset AFK handler di libsamp.so ────────────────────
-#define AFK_HANDLER_OFF  0x1514D0
-
 // ─── Dobby ───────────────────────────────────────────────
 typedef int (*DobbyHook_t)(void* addr, void* hook, void** orig);
 static DobbyHook_t DobbyHook = nullptr;
 
-// ─── Original pointers ───────────────────────────────────
-static void    (*AFKHandler_orig)()                          = nullptr;
+// ─── Original sendto ─────────────────────────────────────
 static ssize_t (*sendto_orig)(int, const void*, size_t,
                                int, const struct sockaddr*,
-                               socklen_t)                    = nullptr;
+                               socklen_t) = nullptr;
 
-// ─── Util: base library dari /proc/self/maps ─────────────
-static uintptr_t getLibBase(const char* libname) {
-    FILE* f = fopen("/proc/self/maps", "r");
-    if (!f) return 0;
-    char line[512];
-    uintptr_t base = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (strstr(line, libname)) {
-            sscanf(line, "%x-", &base);
-            break;
-        }
-    }
-    fclose(f);
-    return base;
-}
-
-// ─── Konfirmasi visual: tulis file ke sdcard ─────────────
+// ─── Status file ─────────────────────────────────────────
 static void writeStatus(const char* msg) {
     FILE* f = fopen("/storage/emulated/0/Download/antiafk_status.txt", "a");
-    if (f) {
-        fprintf(f, "[AntiAFK] %s\n", msg);
-        fclose(f);
-    }
+    if (f) { fprintf(f, "[AntiAFK] %s\n", msg); fclose(f); }
 }
 
-// ─── Hook 1: AFK Handler ─────────────────────────────────
-void AFKHandler_hook() {
-    LOGI("AFK handler blocked!");
-    writeStatus("AFK blocked!");
-}
-
-// ─── Hook 2: sendto filter ───────────────────────────────
+// ─── Hook: sendto filter ─────────────────────────────────
+// Drop packet UDP yang mengandung AFK signature
 ssize_t sendto_hook(int sockfd,
                     const void* buf, size_t len,
                     int flags,
@@ -86,6 +57,7 @@ ssize_t sendto_hook(int sockfd,
             if (d[i] == 'A' && (i+2) < len &&
                 d[i+1] == 'F' && d[i+2] == 'K') {
                 LOGI("AFK packet dropped (len=%zu)", len);
+                writeStatus("AFK packet dropped!");
                 return (ssize_t)len;
             }
         }
@@ -120,37 +92,21 @@ void OnModLoad() {
     }
     DobbyHook = (DobbyHook_t)dlsym(dobbyLib, "DobbyHook");
     if (!DobbyHook) {
-        LOGE("DobbyHook symbol not found");
-        writeStatus("ERROR: DobbyHook not found");
+        LOGE("DobbyHook not found");
+        writeStatus("ERROR: DobbyHook symbol not found");
         return;
     }
-    LOGI("Dobby OK");
+    writeStatus("Dobby OK");
 
-    // Base libsamp.so
-    uintptr_t sampBase = getLibBase("libsamp.so");
-    if (!sampBase) {
-        LOGE("libsamp.so base not found");
-        writeStatus("ERROR: libsamp.so not found");
-        return;
-    }
-    LOGI("libsamp.so base: 0x%X", (unsigned)sampBase);
-    writeStatus("libsamp.so found");
+    // ── Hook: sendto saja dulu ────────────────────────────
+    // Hook 1 (AFK handler direct) di-skip dulu karena
+    // offset 0x1514D0 perlu diverifikasi ulang via objdump -M thumb
+    int r = DobbyHook((void*)sendto,
+                      (void*)sendto_hook,
+                      (void**)&sendto_orig);
+    LOGI("Hook sendto: %s", r == 0 ? "OK" : "FAIL");
+    writeStatus(r == 0 ? "Hook sendto: OK" : "Hook sendto: FAIL");
 
-    // Hook 1: AFK handler (Thumb +1)
-    uintptr_t afkAddr = sampBase + AFK_HANDLER_OFF + 1;
-    int r1 = DobbyHook((void*)afkAddr,
-                       (void*)AFKHandler_hook,
-                       (void**)&AFKHandler_orig);
-    LOGI("Hook1 AFK: %s (0x%X)", r1 == 0 ? "OK" : "FAIL", (unsigned)afkAddr);
-    writeStatus(r1 == 0 ? "Hook1 AFK: OK" : "Hook1 AFK: FAIL");
-
-    // Hook 2: sendto
-    int r2 = DobbyHook((void*)sendto,
-                       (void*)sendto_hook,
-                       (void**)&sendto_orig);
-    LOGI("Hook2 sendto: %s", r2 == 0 ? "OK" : "FAIL");
-    writeStatus(r2 == 0 ? "Hook2 sendto: OK" : "Hook2 sendto: FAIL");
-
-    LOGI("AntiAFK v1.0 loaded!");
+    LOGI("AntiAFK v1.0 loaded! (sendto filter active)");
     writeStatus("=== AntiAFK v1.0 LOADED ===");
 }
