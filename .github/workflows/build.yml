@@ -1,0 +1,47 @@
+name: Build AntiAFK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r21e
+          add-to-path: true
+
+      - name: Build with ndk-build
+        run: |
+          cd ${{ github.workspace }}
+          ndk-build NDK_PROJECT_PATH=. \
+                    APP_BUILD_SCRIPT=jni/Android.mk \
+                    NDK_APPLICATION_MK=jni/Application.mk \
+                    -j$(nproc)
+
+      - name: Check output
+        run: |
+          echo "=== Built files ==="
+          find libs/ -name "*.so" | xargs ls -lh
+
+          echo "=== Verify exports ==="
+          find libs/ -name "*.so" -exec sh -c \
+            'echo "--- $1 ---"; nm -D "$1" | grep -E "__GetModInfo|OnModPreLoad|OnModLoad"' \
+            _ {} \;
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libantiafk
+          path: libs/armeabi-v7a/libantiafk.so
+          if-no-files-found: error
