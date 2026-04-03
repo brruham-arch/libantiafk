@@ -11,19 +11,25 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-// ─── ModInfo — tanpa handlerVer, sesuai AML 1.2.1 ───────
+// ─── ModInfo sesuai AML 1.2.1 (RusJJ) ───────────────────
 struct ModInfo_t {
-    const char* id;
-    const char* name;
-    const char* version;
-    const char* author;
+    unsigned int  nHandlerVer;  // wajib = 1
+    const char*   szGUID;
+    const char*   szName;
+    const char*   szAuthor;
+    const char*   szVersion;
+    unsigned int  nGameVer;
+    unsigned int  nMinAPIVer;
 };
 
 static ModInfo_t g_modInfo = {
-    "antiafk",
+    1,
+    "com.brruham.antiafk",
     "Anti AFK",
+    "brruham-arch",
     "1.0",
-    "brruham-arch"
+    0,
+    0
 };
 
 // ─── Offset AFK handler di libsamp.so ───────────────────
