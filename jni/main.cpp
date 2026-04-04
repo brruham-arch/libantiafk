@@ -5,7 +5,6 @@
 #include <stdio.h>
 #include <time.h>
 #include <pthread.h>
-#include <sys/socket.h>
 #include <sys/mman.h>
 #include <errno.h>
 
@@ -15,7 +14,7 @@
 static FILE* g_logFile = nullptr;
 static void logInit() {
     g_logFile = fopen(LOG_PATH, "w");
-    if (g_logFile) { fprintf(g_logFile, "=== AntiAFK v6.3 ===\n"); fflush(g_logFile); }
+    if (g_logFile) { fprintf(g_logFile, "=== AntiAFK v6.4 ===\n"); fflush(g_logFile); }
 }
 static void logWrite(const char* level, const char* fmt, ...) {
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
@@ -36,13 +35,13 @@ struct ModInfo_t {
     unsigned int flags;
 };
 static ModInfo_t g_modInfo = {
-    1, "antiafk", "Anti AFK Pause", "6.3", "brruham-arch", 0
+    1, "antiafk", "Anti AFK Pause", "6.4", "brruham-arch", 0
 };
 
 typedef int (*DobbyHook_t)(void*, void*, void**);
 static DobbyHook_t DobbyHook = nullptr;
 
-// ─── Pause detection ──────────────────────────────────────
+// ─── Pause state (untuk log monitoring) ───────────────────
 static volatile int*     g_isAndroidPaused = nullptr;
 static volatile uint8_t* g_userPause       = nullptr;
 
@@ -57,24 +56,23 @@ static uintptr_t getLibBase(const char* libname) {
     return base;
 }
 
-// ─── Hook StopThread ──────────────────────────────────────
-// StopThread dipanggil saat game pause → RakNet network thread berhenti
-// Kita intercept dan skip pemanggilan saat pause game/map
-static void (*StopThread_orig)() = nullptr;
-static void StopThread_hook() {
-    int androidPaused = g_isAndroidPaused ? *g_isAndroidPaused : 0;
-    int userPaused    = g_userPause        ? (int)*g_userPause  : 0;
-    if (androidPaused || userPaused) {
-        // Game sedang pause karena map/menu atau Home — jangan stop network thread
-        LOGDBG("StopThread intercepted — network thread KEPT ALIVE");
-        return;
-    }
-    // Bukan dari pause (misal disconnect / game exit) — jalankan normal
-    LOG("StopThread: allowed (non-pause context)");
-    if (StopThread_orig) StopThread_orig();
+// ─── Hook AndroidPaused() ─────────────────────────────────
+// AndroidPaused() adalah fungsi yang di-poll NVThread system
+// untuk decide apakah suspend semua thread.
+// Kalau kita return 0 selalu → tidak ada thread yang di-suspend
+// → RakNet network thread SA-MP tetap jalan saat pause.
+//
+// AndroidPaused() @ libGTASA.so + 0x269ad4
+// Signature: int AndroidPaused(void)
+//
+static int (*AndroidPaused_orig)() = nullptr;
+static int AndroidPaused_hook() {
+    // Selalu report "tidak paused" ke NVThread system
+    // sehingga network thread SA-MP tidak di-suspend
+    return 0;
 }
 
-// ─── Monitoring thread (opsional, untuk log state) ────────
+// ─── Monitor thread (log state perubahan) ─────────────────
 static void* monitorThread(void*) {
     int lastAndroid = -1;
     int lastUser    = -1;
@@ -86,7 +84,7 @@ static void* monitorThread(void*) {
         int userPaused    = g_userPause        ? (int)*g_userPause  : 0;
 
         if (androidPaused != lastAndroid) {
-            LOG("AndroidPaused: %d → %d", lastAndroid, androidPaused);
+            LOG("IsAndroidPaused: %d → %d", lastAndroid, androidPaused);
             lastAndroid = androidPaused;
         }
         if (userPaused != lastUser) {
@@ -104,7 +102,7 @@ void* __GetModInfo() { return &g_modInfo; }
 extern "C" __attribute__((visibility("default")))
 void OnModPreLoad() {
     logInit();
-    LOG("=== AntiAFK v6.3 ===");
+    LOG("=== AntiAFK v6.4 ===");
     LOG("PreLoad OK");
 }
 
@@ -119,52 +117,48 @@ void OnModLoad() {
     if (!DobbyHook) { LOGERR("DobbyHook not found"); return; }
     LOG("Dobby OK");
 
-    // Cari base libGTASA.so — untuk pause detection
+    // Cari base libGTASA.so
     uintptr_t gtasaBase = getLibBase("libGTASA.so");
-    if (gtasaBase) {
-        g_isAndroidPaused = (volatile int*)(gtasaBase + 0x6855bc);
-        g_userPause       = (volatile uint8_t*)(gtasaBase + 0x96b514);
-        LOG("IsAndroidPaused @ 0x%X = %d",
-            (unsigned)(gtasaBase + 0x6855bc), (int)*g_isAndroidPaused);
-        LOG("m_UserPause     @ 0x%X = %d",
-            (unsigned)(gtasaBase + 0x96b514), (int)*g_userPause);
-    } else {
-        LOGERR("libGTASA.so tidak ketemu");
-    }
+    if (!gtasaBase) { LOGERR("libGTASA.so tidak ketemu"); return; }
+    LOG("libGTASA.so base: 0x%X", (unsigned)gtasaBase);
 
-    // Cari base libsamp.so — untuk hook StopThread
-    uintptr_t sampBase = getLibBase("libsamp.so");
-    if (!sampBase) { LOGERR("libsamp.so tidak ketemu"); return; }
-    LOG("libsamp.so base: 0x%X", (unsigned)sampBase);
+    // Setup pointer untuk monitoring
+    g_isAndroidPaused = (volatile int*)(gtasaBase + 0x6855bc);
+    g_userPause       = (volatile uint8_t*)(gtasaBase + 0x96b514);
+    LOG("IsAndroidPaused @ 0x%X = %d",
+        (unsigned)(gtasaBase + 0x6855bc), (int)*g_isAndroidPaused);
+    LOG("m_UserPause     @ 0x%X = %d",
+        (unsigned)(gtasaBase + 0x96b514), (int)*g_userPause);
 
-    // StopThread RakNet di libsamp.so
-    // Offset dari nm: 0x252b92
-    // Thumb function → Dobby butuh address + 1
-    uintptr_t stopThreadAddr = sampBase + 0x252b92;
+    // Hook AndroidPaused() — Thumb function, butuh +1
+    // Offset dari nm: 0x269ad4
+    uintptr_t androidPausedAddr = gtasaBase + 0x269ad4;
     int r = DobbyHook(
-        (void*)(stopThreadAddr + 1),
-        (void*)StopThread_hook,
-        (void**)&StopThread_orig
+        (void*)(androidPausedAddr + 1),   // +1 = Thumb mode
+        (void*)AndroidPaused_hook,
+        (void**)&AndroidPaused_orig
     );
-    LOG("Hook StopThread @ 0x%X: %s", (unsigned)stopThreadAddr, r==0?"OK":"FAIL");
+    LOG("Hook AndroidPaused @ 0x%X: %s",
+        (unsigned)androidPausedAddr, r == 0 ? "OK" : "FAIL");
 
     if (r != 0) {
-        // Fallback: NOP manual — tulis BX LR (Thumb = 0x4770)
-        LOG("Dobby gagal, coba NOP manual...");
-        void* target = (void*)stopThreadAddr;
-        uintptr_t page = stopThreadAddr & ~0xFFF;
-        int mp = mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC);
-        if (mp == 0) {
+        // Fallback: patch manual — tulis "MOV R0, #0 / BX LR" (Thumb)
+        // MOV R0, #0 = 0x2000, BX LR = 0x4770
+        LOG("Dobby gagal, coba manual patch...");
+        void* target = (void*)androidPausedAddr;
+        uintptr_t page = androidPausedAddr & ~0xFFF;
+        if (mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
             uint16_t* p = (uint16_t*)target;
-            p[0] = 0x4770; // BX LR
-            __builtin___clear_cache((char*)target, (char*)target + 2);
-            LOG("NOP StopThread: OK");
+            p[0] = 0x2000; // MOV R0, #0
+            p[1] = 0x4770; // BX LR
+            __builtin___clear_cache((char*)target, (char*)target + 4);
+            LOG("Manual patch AndroidPaused: OK");
         } else {
-            LOGERR("NOP StopThread: mprotect FAIL errno=%d", errno);
+            LOGERR("mprotect FAIL errno=%d", errno);
         }
     }
 
-    // Jalankan monitor thread untuk log state
+    // Monitor thread untuk log state
     pthread_t thread;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -172,6 +166,6 @@ void OnModLoad() {
     pthread_create(&thread, &attr, monitorThread, nullptr);
     pthread_attr_destroy(&attr);
 
-    LOG("=== AntiAFK v6.3 LOADED ===");
-    LOG("Strategy: StopThread hook — RakNet network thread tetap hidup saat pause");
+    LOG("=== AntiAFK v6.4 LOADED ===");
+    LOG("Strategy: AndroidPaused() hook → NVThread tidak suspend SA-MP");
 }
