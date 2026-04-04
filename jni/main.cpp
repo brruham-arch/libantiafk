@@ -19,7 +19,7 @@ struct ModInfo_t {
     unsigned int flags;
 };
 static ModInfo_t g_modInfo = {
-    1, "antiafk", "Anti AFK Pause", "3.0", "brruham-arch", 0
+    1, "antiafk", "Anti AFK Pause", "3.1", "brruham-arch", 0
 };
 
 // ─── Dobby ───────────────────────────────────────────────
@@ -27,14 +27,14 @@ typedef int (*DobbyHook_t)(void* addr, void* hook, void** orig);
 static DobbyHook_t DobbyHook = nullptr;
 
 // ─── Original pointers ───────────────────────────────────
-// AndroidPaused() → getter yang dibaca SA-MP untuk cek status pause
-static int  (*AndroidPaused_orig)()   = nullptr;
-// SetAndroidPaused(int) → setter, tetap kita hook untuk logging
+static int  (*AndroidPaused_orig)()       = nullptr;
 static void (*SetAndroidPaused_orig)(int) = nullptr;
 
-// ─── Global: pointer ke IsAndroidPaused variable ─────────
-// Sebagai fallback watchdog jika hook getter tidak cukup
+// ─── State ───────────────────────────────────────────────
 static volatile int* g_isAndroidPaused = nullptr;
+// Flag: aktifkan bypass hanya setelah game fully loaded
+// Delay 10 detik dari launch agar init game selesai dulu
+static volatile bool g_bypassActive = false;
 
 // ─── Realtime Logger ─────────────────────────────────────
 static FILE* g_logFile = nullptr;
@@ -42,7 +42,7 @@ static FILE* g_logFile = nullptr;
 static void logInit() {
     g_logFile = fopen(LOG_PATH, "w");
     if (g_logFile) {
-        fprintf(g_logFile, "=== AntiAFK Log v3.0 ===\n");
+        fprintf(g_logFile, "=== AntiAFK Log v3.1 ===\n");
         fflush(g_logFile);
     }
 }
@@ -53,13 +53,11 @@ static void logWrite(const char* level, const char* fmt, ...) {
     struct tm* t = localtime(&ts.tv_sec);
     char tbuf[32];
     strftime(tbuf, sizeof(tbuf), "%H:%M:%S", t);
-
     char mbuf[512];
     va_list args;
     va_start(args, fmt);
     vsnprintf(mbuf, sizeof(mbuf), fmt, args);
     va_end(args);
-
     if (g_logFile) {
         fprintf(g_logFile, "[%s.%03ld] [%s] %s\n",
                 tbuf, ts.tv_nsec/1000000, level, mbuf);
@@ -74,7 +72,7 @@ static void logWrite(const char* level, const char* fmt, ...) {
 #define LOGERR(...) logWrite("ERR", __VA_ARGS__)
 #define LOGDBG(...) logWrite("DBG", __VA_ARGS__)
 
-// ─── Util: base library dari /proc/self/maps ─────────────
+// ─── Util ─────────────────────────────────────────────────
 static uintptr_t getLibBase(const char* libname) {
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f) return 0;
@@ -91,32 +89,41 @@ static uintptr_t getLibBase(const char* libname) {
 }
 
 // ─── Hook: AndroidPaused() ───────────────────────────────
-// Ini getter yang dibaca SA-MP sync thread untuk cek pause state
-// Kita selalu return 0 → SA-MP pikir game tidak pernah pause
 int AndroidPaused_hook() {
-    // Log hanya sekali per transisi supaya tidak flood
-    static int lastVal = 0;
     int realVal = AndroidPaused_orig ? AndroidPaused_orig() : 0;
+
+    // Bypass hanya aktif setelah game selesai init
+    if (!g_bypassActive) {
+        return realVal; // jangan ganggu saat init
+    }
+
+    // Log hanya saat transisi
+    static int lastVal = -1;
     if (realVal != lastVal) {
-        LOG("AndroidPaused() = %d (kita return 0)", realVal);
+        LOG("AndroidPaused() = %d → return 0 (bypass active)", realVal);
         lastVal = realVal;
     }
-    return 0; // selalu tidak paused
+    return 0;
 }
 
 // ─── Hook: SetAndroidPaused(int) ─────────────────────────
-// Untuk logging saja — kita tetap panggil orig
 void SetAndroidPaused_hook(int isPaused) {
-    LOG("SetAndroidPaused(%d) dipanggil", isPaused);
+    if (g_bypassActive) {
+        LOG("SetAndroidPaused(%d) intercepted", isPaused);
+    }
     if (SetAndroidPaused_orig) SetAndroidPaused_orig(isPaused);
-    LOG("SetAndroidPaused orig done");
 }
 
 // ─── Watchdog thread ─────────────────────────────────────
-// Fallback: paksa IsAndroidPaused = 0 setiap 100ms
-// Jalan paralel dengan hook, double protection
 static void* watchdogThread(void*) {
-    LOG("Watchdog thread started");
+    // Tunggu 10 detik dulu → game pasti sudah selesai loading
+    LOG("Watchdog: menunggu 10 detik sebelum aktif...");
+    struct timespec delay = { 10, 0 };
+    nanosleep(&delay, nullptr);
+
+    g_bypassActive = true;
+    LOG("Watchdog: AKTIF — bypass pause dimulai");
+
     while (true) {
         if (g_isAndroidPaused && *g_isAndroidPaused != 0) {
             LOGDBG("Watchdog: paksa IsAndroidPaused = 0");
@@ -136,7 +143,7 @@ void* __GetModInfo() { return &g_modInfo; }
 extern "C" __attribute__((visibility("default")))
 void OnModPreLoad() {
     logInit();
-    LOG("=== AntiAFK Pause v3.0 ===");
+    LOG("=== AntiAFK Pause v3.1 ===");
     LOG("PreLoad OK");
 }
 
@@ -151,32 +158,26 @@ void OnModLoad() {
     if (!DobbyHook) { LOGERR("DobbyHook not found"); return; }
     LOG("Dobby OK");
 
-    // ── libGTASA via dlopen ───────────────────────────────
     uintptr_t gtasaBase = getLibBase("libGTASA.so");
     LOG("libGTASA.so base: 0x%X", (unsigned)gtasaBase);
-
     void* gtasaLib = dlopen("libGTASA.so", RTLD_NOW | RTLD_NOLOAD);
 
-    // ── Hook 1: AndroidPaused() ← KUNCI UTAMA ────────────
-    // SA-MP sync thread panggil ini sebelum kirim packet
+    // ── Hook 1: AndroidPaused() ───────────────────────────
     {
         void* sym = gtasaLib ? dlsym(gtasaLib, "_Z13AndroidPausedv") : nullptr;
-        if (!sym && gtasaBase) {
-            // Fallback offset: 0x00269ad4, ARM (bukan Thumb) → tidak +1
+        if (!sym && gtasaBase)
             sym = (void*)(gtasaBase + 0x269ad4);
-            LOG("AndroidPaused fallback ke offset 0x269ad4");
-        }
         if (sym) {
             int r = DobbyHook(sym,
                               (void*)AndroidPaused_hook,
                               (void**)&AndroidPaused_orig);
             LOG("Hook1 AndroidPaused(): %s @ %p", r==0?"OK":"FAIL", sym);
         } else {
-            LOGERR("AndroidPaused symbol tidak ketemu!");
+            LOGERR("AndroidPaused symbol tidak ketemu");
         }
     }
 
-    // ── Hook 2: SetAndroidPaused(int) ← logging ──────────
+    // ── Hook 2: SetAndroidPaused(int) ─────────────────────
     {
         void* sym = gtasaLib ? dlsym(gtasaLib, "_Z16SetAndroidPausedi") : nullptr;
         if (!sym && gtasaBase)
@@ -189,23 +190,23 @@ void OnModLoad() {
         }
     }
 
-    // ── Pointer ke IsAndroidPaused global variable ────────
-    // 0x006855bc = offset di libGTASA.so (D = data symbol)
+    // ── Pointer ke IsAndroidPaused global var ─────────────
     if (gtasaBase) {
         g_isAndroidPaused = (volatile int*)(gtasaBase + 0x6855bc);
-        LOG("IsAndroidPaused var @ %p (val=%d)",
+        LOG("IsAndroidPaused var @ %p (val sekarang=%d)",
             g_isAndroidPaused, (int)*g_isAndroidPaused);
+        LOG("Nilai 1 saat init = normal, watchdog belum aktif");
     }
 
-    // ── Watchdog thread ───────────────────────────────────
+    // ── Watchdog thread (delay 10 detik) ──────────────────
     pthread_t wdThread;
-    int wr = pthread_create(&wdThread, nullptr, watchdogThread, nullptr);
-    if (wr == 0) {
+    if (pthread_create(&wdThread, nullptr, watchdogThread, nullptr) == 0) {
         pthread_detach(wdThread);
-        LOG("Watchdog thread started OK");
+        LOG("Watchdog thread created, aktif dalam 10 detik");
     } else {
-        LOGERR("Watchdog thread failed: %d", wr);
+        LOGERR("Watchdog thread gagal dibuat");
     }
 
-    LOG("=== AntiAFK Pause v3.0 LOADED ===");
+    LOG("=== AntiAFK Pause v3.1 LOADED ===");
+    LOG("Bypass akan aktif 10 detik setelah launch");
 }
